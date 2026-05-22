@@ -194,9 +194,9 @@ function (file, record, search, format, log) {
         var searchObj = search.create({
             type: 'customrecord_credit_card_backend_mapping',
             filters: [
-                ['custrecord_card_number', 'contains', cardNo],
+                ['custrecord_card_number', 'anyof', cardNo],
                 'AND',
-                ['custrecord_category', 'contains', category]
+                ['custrecord_category', 'anyof', category]
             ],
             columns: [
                 'custrecord_account_number',

@@ -11,11 +11,12 @@ function (file, record, search, format, log) {
 
     var DEFAULT_TRANID_START_FROM = 70905;
 
-    var BACKEND_MAPPING_RECORD_TYPE = 'customrecord_credit_card_backend_mapping';
-    var MAPPING_CARD_FIELD_ID = 'custrecord_card_number';
-    var MAPPING_CATEGORY_FIELD_ID = 'custrecord_category';
-    var MAPPING_EXPENSE_ACCOUNT_FIELD_ID = 'custrecord_account_number';
-    var MAPPING_EMPLOYEE_NAME_FIELD_ID = 'custrecord_employee_name';
+    var MAPPING_RECORD_TYPE = 'customrecord_credit_card_backend_mapping';
+
+    var MAP_EMPLOYEE_NAME_FIELD = 'custrecord_employee_name';
+    var MAP_CARD_NUMBER_FIELD = 'custrecord_card_number';
+    var MAP_CATEGORY_FIELD = 'custrecord_category';
+    var MAP_ACCOUNT_NUMBER_FIELD = 'custrecord_account_number';
 
     var IGNORE_DESCRIPTION_LIST = [
         'ULINE  *SHIP SUPPLIES',
@@ -29,8 +30,7 @@ function (file, record, search, format, log) {
         '8787': 244,
         '8998': 244,
         '3434': 244,
-        '9848': 244,
-        '2359': 244
+        '9848': 244
     };
 
     function getInputData() {
@@ -38,34 +38,72 @@ function (file, record, search, format, log) {
         var allRows = [];
         var nextTranId = getNextTranIdNumber();
 
-        log.audit('GET INPUT STARTED', {
-            pendingFileCount: pendingFiles.length,
-            startingTranId: nextTranId
-        });
-
         if (!pendingFiles || pendingFiles.length === 0) {
+            log.audit('No Pending Files Found', PENDING_FOLDER_ID);
             return [];
         }
+
+        log.audit('Starting Tran ID Sequence', nextTranId);
 
         for (var i = 0; i < pendingFiles.length; i++) {
             try {
                 var inputFile = file.load({ id: pendingFiles[i].id });
+
+                log.audit('Processing Pending File', {
+                    fileId: pendingFiles[i].id,
+                    fileName: pendingFiles[i].name
+                });
+
                 var rows = parseTransactionFile(inputFile.getContents(), pendingFiles[i]);
 
+                if (!rows || rows.length === 0) {
+                    allRows.push({
+                        SourceFileId: pendingFiles[i].id,
+                        SourceFileName: pendingFiles[i].name,
+                        LineNo: '',
+                        Card: '',
+                        TransactionDate: '',
+                        PostDate: '',
+                        Description: '',
+                        Amount: '',
+                        TranIdNumber: '',
+                        InputError: 'No data rows found in file.'
+                    });
+                    continue;
+                }
+
                 for (var r = 0; r < rows.length; r++) {
-                    if (isIgnoredDescription(rows[r].Description)) {
-                        rows[r].IsSkippedLine = true;
-                        rows[r].TranIdNumber = '';
-                        rows[r].InputError = 'Skipped description, transaction not created: ' + rows[r].Description;
-                    } else {
-                        rows[r].TranIdNumber = nextTranId;
-                        nextTranId = incrementBigNumberString(nextTranId);
+                    var row = rows[r];
+
+                    if (isIgnoredDescription(row.Description)) {
+                        row.IsSkippedLine = true;
+                        row.TranIdNumber = '';
+                        row.InputError = 'Skipped description, transaction not created: ' + row.Description;
+                        allRows.push(row);
+                        continue;
                     }
 
-                    allRows.push(rows[r]);
+                    var validationError = validateRow(row);
+
+                    if (validationError) {
+                        row.TranIdNumber = '';
+                        row.InputError = validationError;
+                        allRows.push(row);
+                        continue;
+                    }
+
+                    row.TranIdNumber = nextTranId;
+                    nextTranId++;
+
+                    allRows.push(row);
                 }
 
             } catch (e) {
+                log.error('Input File Failed', {
+                    file: pendingFiles[i],
+                    error: getErrorMessage(e)
+                });
+
                 allRows.push({
                     SourceFileId: pendingFiles[i].id,
                     SourceFileName: pendingFiles[i].name,
@@ -74,7 +112,6 @@ function (file, record, search, format, log) {
                     TransactionDate: '',
                     PostDate: '',
                     Description: '',
-                    Category: '',
                     Amount: '',
                     TranIdNumber: '',
                     InputError: getErrorMessage(e)
@@ -89,99 +126,98 @@ function (file, record, search, format, log) {
         var row = JSON.parse(context.value);
 
         try {
-            log.audit('ROW PROCESS STARTED', row);
-
             if (row.InputError) {
                 throw row.InputError;
             }
 
             var cardNo = cleanValue(row.Card);
             var description = cleanValue(row.Description);
-            var category = cleanValue(row.Category);
-            var postDateText = cleanValue(row.PostDate);
-            var rawAmountText = cleanValue(row.Amount);
-
-            if (!cardNo) throw 'Missing Card Number';
-            if (!description) throw 'Missing Description';
-            if (!category) throw 'Missing Category';
-            if (!postDateText) throw 'Missing Post Date';
-            if (!rawAmountText) throw 'Missing Amount';
 
             var creditCardAccountId = CARD_ACCOUNT_MAP[cardNo];
 
             if (!creditCardAccountId) {
-                throw 'No header account mapping found for card number: ' + cardNo;
+                throw 'No header credit card account mapping found for card number: ' + cardNo;
             }
 
-            var rawAmount = parseSignedAmount(rawAmountText);
+            var rawAmount = parseSignedAmount(row.Amount);
             var amountPositive = Math.abs(rawAmount);
             var recordType = rawAmount < 0 ? 'creditcardcharge' : 'creditcardrefund';
 
-            var postDate = parseDate(postDateText);
+            var postDate = parseDate(row.PostDate);
             var postingPeriodId = getPostingPeriod(postDate);
 
-            var entityInfo = getOtherNameEntityInfoFromDescription(description);
-            var entityId = entityInfo.id;
+            var mapping = getCardMapping(cardNo);
 
-            var expenseLine = getExpenseLineFromBackendMapping(cardNo, category);
-            var historicalLine = getHistoricalExpenseLine(description);
-
+            var expenseAccountId = '';
+            var classId = '';
             var employeeName = '';
 
-            if (expenseLine && expenseLine.employeeName) {
-                employeeName = expenseLine.employeeName;
+            if (mapping && mapping.expenseAccountId) {
+                expenseAccountId = mapping.expenseAccountId;
+                employeeName = mapping.employeeName || '';
+            } else {
+                var historicalLine = getHistoricalExpenseLine(description);
+
+                if (!historicalLine || !historicalLine.accountId) {
+                    throw 'No custom mapping or historical expense account found for card/description: ' + cardNo + ' / ' + description;
+                }
+
+                expenseAccountId = historicalLine.accountId;
+                classId = historicalLine.classId || '';
             }
 
-            if (!expenseLine || !expenseLine.accountId) {
-                expenseLine = historicalLine;
-            }
-
-            if (!expenseLine || !expenseLine.accountId) {
-                throw 'No expense account found from custom mapping or history. Card: ' + cardNo + ' | Category: ' + category + ' | Description: ' + description;
-            }
-
-            if (historicalLine && historicalLine.classId) {
-                expenseLine.classId = historicalLine.classId;
-            }
-
-            if (!expenseLine.classId) {
-                throw 'Class is blank in historical transaction for description: ' + description;
-            }
-
-            var finalMemo = buildMainMemo(employeeName, description);
-
-            log.debug('FINAL VALUES BEFORE CREATE', {
-                cardNo: cardNo,
-                category: category,
-                employeeName: employeeName,
-                finalMemo: finalMemo,
-                headerAccount: creditCardAccountId,
-                expenseAccount: expenseLine.accountId,
-                classId: expenseLine.classId,
-                amount: amountPositive,
-                recordType: recordType
-            });
+            var memoText = employeeName ? employeeName + ' - ' + description : description;
 
             var ccRec = record.create({
                 type: recordType,
                 isDynamic: true
             });
 
-            ccRec.setValue({ fieldId: 'tranid', value: String(row.TranIdNumber) });
-            ccRec.setValue({ fieldId: 'entity', value: entityId });
-            ccRec.setValue({ fieldId: 'account', value: creditCardAccountId });
-            ccRec.setValue({ fieldId: 'usertotal', value: amountPositive });
-            ccRec.setValue({ fieldId: 'trandate', value: postDate });
-            ccRec.setValue({ fieldId: 'postingperiod', value: postingPeriodId });
-            ccRec.setValue({ fieldId: 'memo', value: finalMemo });
-            ccRec.setValue({ fieldId: 'class', value: expenseLine.classId });
+            ccRec.setValue({
+                fieldId: 'tranid',
+                value: String(row.TranIdNumber)
+            });
 
-            ccRec.selectNewLine({ sublistId: 'expense' });
+            ccRec.setValue({
+                fieldId: 'account',
+                value: creditCardAccountId
+            });
+
+            ccRec.setValue({
+                fieldId: 'usertotal',
+                value: amountPositive
+            });
+
+            ccRec.setValue({
+                fieldId: 'trandate',
+                value: postDate
+            });
+
+            ccRec.setValue({
+                fieldId: 'postingperiod',
+                value: postingPeriodId
+            });
+
+            ccRec.setValue({
+                fieldId: 'memo',
+                value: memoText
+            });
+
+            if (classId) {
+                ccRec.setValue({
+                    fieldId: 'class',
+                    value: classId
+                });
+            }
+
+            ccRec.selectNewLine({
+                sublistId: 'expense'
+            });
 
             ccRec.setCurrentSublistValue({
                 sublistId: 'expense',
                 fieldId: 'account',
-                value: expenseLine.accountId
+                value: expenseAccountId
             });
 
             ccRec.setCurrentSublistValue({
@@ -193,26 +229,31 @@ function (file, record, search, format, log) {
             ccRec.setCurrentSublistValue({
                 sublistId: 'expense',
                 fieldId: 'memo',
-                value: finalMemo
+                value: memoText
             });
 
-            ccRec.setCurrentSublistValue({
-                sublistId: 'expense',
-                fieldId: 'class',
-                value: expenseLine.classId
-            });
+            if (classId) {
+                ccRec.setCurrentSublistValue({
+                    sublistId: 'expense',
+                    fieldId: 'class',
+                    value: classId
+                });
+            }
 
-            ccRec.commitLine({ sublistId: 'expense' });
+            ccRec.commitLine({
+                sublistId: 'expense'
+            });
 
             var recId = ccRec.save({
                 enableSourcing: true,
                 ignoreMandatoryFields: false
             });
 
-            log.audit('TRANSACTION CREATED SUCCESSFULLY', {
+            log.audit('Credit Card Transaction Created', {
+                line: row.LineNo,
                 tranid: row.TranIdNumber,
-                recordId: recId,
-                recordType: recordType
+                recordType: recordType,
+                recordId: recId
             });
 
             context.write({
@@ -229,11 +270,10 @@ function (file, record, search, format, log) {
         } catch (e) {
             row.ErrorMessage = getErrorMessage(e);
 
-            log.error('CREDIT CARD ROW FAILED', {
+            log.error('Credit Card Row Failed', {
                 line: row.LineNo,
                 tranid: row.TranIdNumber,
-                row: row,
-                error: e
+                error: row.ErrorMessage
             });
 
             context.write({
@@ -245,15 +285,14 @@ function (file, record, search, format, log) {
 
     function summarize(summary) {
         var fileStatus = {};
-        var totalCreated = 0;
-        var totalSkipped = 0;
-        var totalErrors = 0;
 
         summary.output.iterator().each(function (key, value) {
             var obj = JSON.parse(value);
             var fileId = obj.SourceFileId;
 
-            if (!fileId) return true;
+            if (!fileId) {
+                return true;
+            }
 
             if (!fileStatus[fileId]) {
                 fileStatus[fileId] = {
@@ -266,64 +305,57 @@ function (file, record, search, format, log) {
 
             if (key === 'SUCCESS') {
                 fileStatus[fileId].successCount++;
-                totalCreated++;
             }
 
             if (key === 'ERROR') {
                 fileStatus[fileId].errorRows.push(obj);
-
-                if (obj.IsSkippedLine === true || obj.IsSkippedLine === 'true') {
-                    totalSkipped++;
-                } else {
-                    totalErrors++;
-                }
             }
 
             return true;
         });
 
-        log.audit('CREDIT CARD IMPORT SUMMARY', {
-            totalCreated: totalCreated,
-            totalSkipped: totalSkipped,
-            totalErrors: totalErrors
+        summary.mapSummary.errors.iterator().each(function (key, error) {
+            log.error('Map Summary Error', {
+                key: key,
+                error: error
+            });
+            return true;
         });
 
         for (var fileId in fileStatus) {
             if (fileStatus.hasOwnProperty(fileId)) {
+
                 if (fileStatus[fileId].errorRows.length > 0) {
                     createErrorFile(fileStatus[fileId]);
                 }
 
                 moveFileToFolder(fileId, PROCESSED_FOLDER_ID);
+
+                log.audit('File Processing Completed', {
+                    fileId: fileId,
+                    fileName: fileStatus[fileId].fileName,
+                    successCount: fileStatus[fileId].successCount,
+                    errorCount: fileStatus[fileId].errorRows.length
+                });
             }
         }
     }
 
-    function getExpenseLineFromBackendMapping(cardNo, category) {
-        var cardInternalId = getCardMappingInternalId(cardNo);
-        var categoryInternalId = getCategoryInternalId(category);
-
-        log.debug('CARD / CATEGORY INTERNAL IDS', {
-            cardNo: cardNo,
-            cardInternalId: cardInternalId,
-            category: category,
-            categoryInternalId: categoryInternalId
-        });
-
-        if (!cardInternalId || !categoryInternalId) {
-            return null;
-        }
+    function getCardMapping(cardNo) {
+        cardNo = cleanValue(cardNo);
 
         var mappingSearch = search.create({
-            type: BACKEND_MAPPING_RECORD_TYPE,
+            type: MAPPING_RECORD_TYPE,
             filters: [
-                [MAPPING_CARD_FIELD_ID, 'anyof', cardInternalId],
+                [MAP_CARD_NUMBER_FIELD, 'is', cardNo],
                 'AND',
-                [MAPPING_CATEGORY_FIELD_ID, 'anyof', categoryInternalId]
+                ['isinactive', 'is', 'F']
             ],
             columns: [
-                search.createColumn({ name: MAPPING_EXPENSE_ACCOUNT_FIELD_ID }),
-                search.createColumn({ name: MAPPING_EMPLOYEE_NAME_FIELD_ID })
+                search.createColumn({ name: MAP_EMPLOYEE_NAME_FIELD }),
+                search.createColumn({ name: MAP_CARD_NUMBER_FIELD }),
+                search.createColumn({ name: MAP_CATEGORY_FIELD }),
+                search.createColumn({ name: MAP_ACCOUNT_NUMBER_FIELD })
             ]
         });
 
@@ -332,88 +364,21 @@ function (file, record, search, format, log) {
             end: 1
         });
 
-        log.debug('BACKEND MAPPING RESULT COUNT', {
-            cardNo: cardNo,
-            category: category,
-            count: results ? results.length : 0
-        });
-
         if (!results || results.length === 0) {
             return null;
         }
 
         return {
-            accountId: results[0].getValue({ name: MAPPING_EXPENSE_ACCOUNT_FIELD_ID }),
-            employeeName: results[0].getText({ name: MAPPING_EMPLOYEE_NAME_FIELD_ID }) ||
-                results[0].getValue({ name: MAPPING_EMPLOYEE_NAME_FIELD_ID }) ||
-                '',
-            classId: ''
+            employeeName: results[0].getValue({ name: MAP_EMPLOYEE_NAME_FIELD }),
+            cardNumber: results[0].getValue({ name: MAP_CARD_NUMBER_FIELD }),
+            category: results[0].getValue({ name: MAP_CATEGORY_FIELD }),
+            expenseAccountId: results[0].getValue({ name: MAP_ACCOUNT_NUMBER_FIELD })
         };
     }
 
-    function getCardMappingInternalId(cardNo) {
-        var cardSearch = search.create({
-            type: BACKEND_MAPPING_RECORD_TYPE,
-            filters: [
-                [MAPPING_CARD_FIELD_ID, 'noneof', '@NONE@']
-            ],
-            columns: [
-                search.createColumn({ name: MAPPING_CARD_FIELD_ID })
-            ]
-        });
-
-        var results = cardSearch.run().getRange({
-            start: 0,
-            end: 1000
-        });
-
-        for (var i = 0; results && i < results.length; i++) {
-            var cardText = results[i].getText({ name: MAPPING_CARD_FIELD_ID });
-            var cardValue = results[i].getValue({ name: MAPPING_CARD_FIELD_ID });
-
-            if (
-                cleanValue(cardText) === cleanValue(cardNo) ||
-                cleanValue(cardValue) === cleanValue(cardNo)
-            ) {
-                return cardValue;
-            }
-        }
-
-        return '';
-    }
-
-    function getCategoryInternalId(category) {
-        var categorySearch = search.create({
-            type: BACKEND_MAPPING_RECORD_TYPE,
-            filters: [
-                [MAPPING_CATEGORY_FIELD_ID, 'noneof', '@NONE@']
-            ],
-            columns: [
-                search.createColumn({ name: MAPPING_CATEGORY_FIELD_ID })
-            ]
-        });
-
-        var results = categorySearch.run().getRange({
-            start: 0,
-            end: 1000
-        });
-
-        for (var i = 0; results && i < results.length; i++) {
-            var categoryText = results[i].getText({ name: MAPPING_CATEGORY_FIELD_ID });
-            var categoryValue = results[i].getValue({ name: MAPPING_CATEGORY_FIELD_ID });
-
-            if (
-                normalizeText(categoryText) === normalizeText(category) ||
-                cleanValue(categoryValue) === cleanValue(category)
-            ) {
-                return categoryValue;
-            }
-        }
-
-        return '';
-    }
-
     function getNextTranIdNumber() {
+        var maxTranId = 0;
+
         var tranSearch = search.create({
             type: search.Type.TRANSACTION,
             filters: [
@@ -424,8 +389,10 @@ function (file, record, search, format, log) {
                 ['tranid', 'isnotempty', '']
             ],
             columns: [
-                search.createColumn({ name: 'internalid', sort: search.Sort.DESC }),
-                search.createColumn({ name: 'tranid' })
+                search.createColumn({
+                    name: 'tranid',
+                    sort: search.Sort.DESC
+                })
             ]
         });
 
@@ -436,13 +403,39 @@ function (file, record, search, format, log) {
 
         if (results && results.length > 0) {
             var tranIdText = cleanValue(results[0].getValue({ name: 'tranid' }));
+            var tranIdNumber = parseInt(tranIdText, 10);
 
-            if (isOnlyDigits(tranIdText)) {
-                return incrementBigNumberString(tranIdText);
+            if (!isNaN(tranIdNumber)) {
+                maxTranId = tranIdNumber;
             }
         }
 
-        return String(DEFAULT_TRANID_START_FROM);
+        if (maxTranId <= 0) {
+            maxTranId = DEFAULT_TRANID_START_FROM - 1;
+        }
+
+        return maxTranId + 1;
+    }
+
+    function validateRow(row) {
+        if (!cleanValue(row.Card)) return 'Missing Card Number';
+        if (!cleanValue(row.Description)) return 'Missing Description';
+        if (!cleanValue(row.PostDate)) return 'Missing Post Date';
+        if (!cleanValue(row.Amount)) return 'Missing Amount';
+
+        try {
+            parseSignedAmount(row.Amount);
+        } catch (e) {
+            return getErrorMessage(e);
+        }
+
+        try {
+            parseDate(row.PostDate);
+        } catch (e2) {
+            return getErrorMessage(e2);
+        }
+
+        return '';
     }
 
     function getHistoricalExpenseLine(description) {
@@ -451,7 +444,9 @@ function (file, record, search, format, log) {
         for (var i = 0; i < candidates.length; i++) {
             var candidate = cleanValue(candidates[i]);
 
-            if (!candidate || candidate.length < 3) continue;
+            if (!candidate || candidate.length < 3) {
+                continue;
+            }
 
             var result = searchHistoricalTransactionLine(candidate);
 
@@ -461,6 +456,39 @@ function (file, record, search, format, log) {
         }
 
         return null;
+    }
+
+    function getHistoricalSearchCandidates(description) {
+        var candidates = [];
+        var cleanDescription = cleanValue(description);
+        var merchantName = cleanMerchantName(cleanDescription);
+
+        addCandidate(candidates, merchantName);
+        addCandidate(candidates, cleanDescription);
+
+        if (cleanDescription.indexOf('*') !== -1) {
+            var beforeStar = cleanValue(cleanDescription.substring(0, cleanDescription.indexOf('*')));
+            var afterStar = cleanValue(cleanDescription.substring(cleanDescription.indexOf('*') + 1));
+
+            addCandidate(candidates, cleanMerchantName(beforeStar));
+            addCandidate(candidates, cleanMerchantName(afterStar));
+        }
+
+        var words = merchantName.split(' ');
+
+        for (var i = 0; i < words.length; i++) {
+            var word = cleanValue(words[i]);
+
+            if (word && word.length >= 4) {
+                addCandidate(candidates, word);
+            }
+        }
+
+        candidates.sort(function (a, b) {
+            return b.length - a.length;
+        });
+
+        return candidates;
     }
 
     function searchHistoricalTransactionLine(searchText) {
@@ -482,125 +510,18 @@ function (file, record, search, format, log) {
                 ]
             ],
             columns: [
-                search.createColumn({ name: 'trandate', sort: search.Sort.DESC }),
+                search.createColumn({
+                    name: 'trandate',
+                    sort: search.Sort.DESC
+                }),
+                search.createColumn({ name: 'internalid' }),
+                search.createColumn({ name: 'tranid' }),
                 search.createColumn({ name: 'account' }),
                 search.createColumn({ name: 'class' })
             ]
         });
 
         var results = tranSearch.run().getRange({
-            start: 0,
-            end: 10
-        });
-
-        if (!results || results.length === 0) {
-            return null;
-        }
-
-        return {
-            accountId: results[0].getValue({ name: 'account' }),
-            classId: results[0].getValue({ name: 'class' }) || ''
-        };
-    }
-
-    function getOtherNameEntityInfoFromDescription(description) {
-        var entityInfo = findEntityFromHistory(description);
-
-        if (entityInfo && entityInfo.id) {
-            return entityInfo;
-        }
-
-        var cleaned = cleanMerchantName(description);
-        var result = findOtherNameByName(cleaned);
-
-        if (result && result.id) {
-            return result;
-        }
-
-        var words = cleanValue(description).toUpperCase().split(/\s+/).map(function (w) {
-            return w.replace(/[^A-Z0-9]/g, '');
-        }).filter(function (w) {
-            return w.length >= 4 && !/^[0-9]+$/.test(w);
-        });
-
-        for (var i = 0; i < words.length; i++) {
-            result = findOtherNameByName(words[i]);
-
-            if (result && result.id) {
-                return result;
-            }
-        }
-
-        throw 'Other Name not found. New Other Name will not be created. Description: ' + description;
-    }
-
-    function findEntityFromHistory(description) {
-        var candidates = getHistoricalSearchCandidates(description);
-
-        for (var i = 0; i < candidates.length; i++) {
-            var candidate = cleanValue(candidates[i]);
-
-            if (!candidate || candidate.length < 3) continue;
-
-            var tranSearch = search.create({
-                type: search.Type.TRANSACTION,
-                filters: [
-                    ['type', 'anyof', 'CardChrg', 'CardRfnd'],
-                    'AND',
-                    ['mainline', 'is', 'T'],
-                    'AND',
-                    [
-                        ['memo', 'contains', candidate],
-                        'OR',
-                        ['memomain', 'contains', candidate]
-                    ]
-                ],
-                columns: [
-                    search.createColumn({ name: 'trandate', sort: search.Sort.DESC }),
-                    search.createColumn({ name: 'entity' })
-                ]
-            });
-
-            var results = tranSearch.run().getRange({
-                start: 0,
-                end: 1
-            });
-
-            if (results && results.length > 0) {
-                var entityId = results[0].getValue({ name: 'entity' });
-                var entityName = results[0].getText({ name: 'entity' });
-
-                if (entityId) {
-                    return {
-                        id: entityId,
-                        name: entityName
-                    };
-                }
-            }
-        }
-
-        return null;
-    }
-
-    function findOtherNameByName(otherNameName) {
-        var text = cleanValue(otherNameName);
-
-        if (!text || text.length < 3) return null;
-
-        var entitySearch = search.create({
-            type: 'othername',
-            filters: [
-                ['isinactive', 'is', 'F'],
-                'AND',
-                ['entityid', 'contains', text]
-            ],
-            columns: [
-                search.createColumn({ name: 'internalid' }),
-                search.createColumn({ name: 'entityid' })
-            ]
-        });
-
-        var results = entitySearch.run().getRange({
             start: 0,
             end: 1
         });
@@ -610,24 +531,28 @@ function (file, record, search, format, log) {
         }
 
         return {
-            id: results[0].getValue({ name: 'internalid' }),
-            name: results[0].getValue({ name: 'entityid' })
+            transactionId: results[0].getValue({ name: 'internalid' }),
+            accountId: results[0].getValue({ name: 'account' }),
+            classId: results[0].getValue({ name: 'class' }) || ''
         };
     }
 
-    function buildMainMemo(employeeName, description) {
-        employeeName = cleanValue(employeeName);
-        description = cleanValue(description);
+    function getHeaderAccountIdList() {
+        var ids = [];
+        var seen = {};
 
-        if (employeeName && description) {
-            return employeeName + ' - ' + description;
+        for (var card in CARD_ACCOUNT_MAP) {
+            if (CARD_ACCOUNT_MAP.hasOwnProperty(card)) {
+                var id = String(CARD_ACCOUNT_MAP[card]);
+
+                if (!seen[id]) {
+                    seen[id] = true;
+                    ids.push(id);
+                }
+            }
         }
 
-        if (description) {
-            return description;
-        }
-
-        return employeeName || '';
+        return ids;
     }
 
     function getPendingFiles() {
@@ -639,7 +564,10 @@ function (file, record, search, format, log) {
                 ['folder', 'anyof', PENDING_FOLDER_ID]
             ],
             columns: [
-                search.createColumn({ name: 'internalid', sort: search.Sort.ASC }),
+                search.createColumn({
+                    name: 'internalid',
+                    sort: search.Sort.ASC
+                }),
                 search.createColumn({ name: 'name' })
             ]
         });
@@ -662,7 +590,11 @@ function (file, record, search, format, log) {
         var headerIndex = -1;
 
         for (var i = 0; i < lines.length; i++) {
-            if (lines[i] && lines[i].indexOf('Card') !== -1 && lines[i].indexOf('Amount') !== -1) {
+            if (
+                lines[i] &&
+                lines[i].indexOf('Card') !== -1 &&
+                lines[i].indexOf('Amount') !== -1
+            ) {
                 headerLine = lines[i];
                 headerIndex = i;
                 break;
@@ -677,7 +609,9 @@ function (file, record, search, format, log) {
         var headers = parseDelimitedLine(headerLine, delimiter);
 
         for (var r = headerIndex + 1; r < lines.length; r++) {
-            if (!lines[r] || !cleanValue(lines[r])) continue;
+            if (!lines[r] || !cleanValue(lines[r])) {
+                continue;
+            }
 
             var cols = parseDelimitedLine(lines[r], delimiter);
             var rawObj = {};
@@ -694,46 +628,11 @@ function (file, record, search, format, log) {
                 TransactionDate: getColumn(rawObj, ['transactiondate']),
                 PostDate: getColumn(rawObj, ['postdate']),
                 Description: getColumn(rawObj, ['description']),
-                Category: getColumn(rawObj, ['category']),
                 Amount: getColumn(rawObj, ['amount'])
             });
         }
 
         return data;
-    }
-
-    function getHistoricalSearchCandidates(description) {
-        var candidates = [];
-        var cleanDescription = cleanValue(description);
-        var merchantName = cleanMerchantName(cleanDescription);
-
-        addCandidate(candidates, merchantName);
-        addCandidate(candidates, cleanDescription);
-
-        if (cleanDescription.indexOf('*') !== -1) {
-            addCandidate(candidates, cleanMerchantName(cleanDescription.substring(0, cleanDescription.indexOf('*'))));
-            addCandidate(candidates, cleanMerchantName(cleanDescription.substring(cleanDescription.indexOf('*') + 1)));
-        }
-
-        return candidates;
-    }
-
-    function getHeaderAccountIdList() {
-        var ids = [];
-        var seen = {};
-
-        for (var card in CARD_ACCOUNT_MAP) {
-            if (CARD_ACCOUNT_MAP.hasOwnProperty(card)) {
-                var id = String(CARD_ACCOUNT_MAP[card]);
-
-                if (!seen[id]) {
-                    seen[id] = true;
-                    ids.push(id);
-                }
-            }
-        }
-
-        return ids;
     }
 
     function getPostingPeriod(dateObj) {
@@ -767,11 +666,12 @@ function (file, record, search, format, log) {
             return result[0].getValue({ name: 'internalid' });
         }
 
-        throw 'Posting period not found for date: ' + dateText;
+        throw 'Posting period not found for date.';
     }
 
     function createErrorFile(fileData) {
-        var csv = 'Line No,Tran ID,Card,Transaction Date,Post Date,Description,Amount,Error Message\n';
+        var csv = '';
+        csv += 'Line No,Tran ID,Card,Transaction Date,Post Date,Description,Amount,Error Message\n';
 
         for (var i = 0; i < fileData.errorRows.length; i++) {
             var row = fileData.errorRows[i];
@@ -786,12 +686,14 @@ function (file, record, search, format, log) {
             csv += csvEscape(row.ErrorMessage) + '\n';
         }
 
-        file.create({
+        var errorFile = file.create({
             name: 'credit_card_import_error_' + fileData.fileId + '_' + getDateTimeStamp() + '.csv',
             fileType: file.Type.CSV,
             contents: csv,
             folder: ERROR_FOLDER_ID
-        }).save();
+        });
+
+        errorFile.save();
     }
 
     function moveFileToFolder(fileId, folderId) {
@@ -800,10 +702,10 @@ function (file, record, search, format, log) {
             inputFile.folder = folderId;
             inputFile.save();
         } catch (e) {
-            log.error('FILE MOVE FAILED', {
+            log.error('Unable To Move File', {
                 fileId: fileId,
                 folderId: folderId,
-                error: e
+                error: getErrorMessage(e)
             });
         }
     }
@@ -823,20 +725,33 @@ function (file, record, search, format, log) {
     }
 
     function cleanMerchantName(value) {
-        return cleanValue(value)
-            .replace(/&amp;/g, '&')
-            .replace(/\s+-\s+.*$/g, '')
-            .replace(/\b(TRIP|PAYGO|REBILL|SUBSCRIPTION|PAYMENT|THANK YOU|THANKS|ONLINE|WEB|MOBILE|PURCHASE)\b/gi, '')
-            .replace(/[#\/\\]/g, ' ')
-            .replace(/\./g, ' ')
-            .replace(/\*/g, ' ')
-            .replace(/\s+/g, ' ');
+        var text = cleanValue(value);
+
+        if (!text) {
+            return '';
+        }
+
+        text = text.replace(/&amp;/g, '&');
+        text = text.replace(/\s+-\s+.*$/g, '');
+        text = text.replace(/\b(TRIP|PAYGO|REBILL|SUBSCRIPTION|PAYMENT|THANK YOU|THANKS|ONLINE|WEB|MOBILE|PURCHASE)\b/gi, '');
+        text = text.replace(/[#\/\\]/g, ' ');
+        text = text.replace(/\./g, ' ');
+        text = text.replace(/\*/g, ' ');
+        text = text.replace(/\s+/g, ' ');
+        text = text.replace(/\s+[0-9]{3,}$/g, '');
+        text = text.replace(/\s+[A-Z]{1,3}\s+[0-9]{3,}$/g, '');
+        text = text.replace(/\s+(NY|NJ|CA|TX|FL|IL|TRI)$/i, '');
+        text = text.replace(/&[A-Z]$/i, '');
+
+        return cleanValue(text);
     }
 
     function addCandidate(candidates, value) {
         var text = cleanValue(value);
 
-        if (!text) return;
+        if (!text) {
+            return;
+        }
 
         for (var i = 0; i < candidates.length; i++) {
             if (normalizeText(candidates[i]) === normalizeText(text)) {
@@ -852,33 +767,6 @@ function (file, record, search, format, log) {
             .toLowerCase()
             .replace(/&/g, 'and')
             .replace(/[^a-z0-9]/g, '');
-    }
-
-    function isOnlyDigits(value) {
-        return /^[0-9]+$/.test(cleanValue(value));
-    }
-
-    function incrementBigNumberString(value) {
-        var digits = cleanValue(value).split('');
-        var carry = 1;
-
-        for (var i = digits.length - 1; i >= 0; i--) {
-            var num = parseInt(digits[i], 10) + carry;
-
-            if (num === 10) {
-                digits[i] = '0';
-            } else {
-                digits[i] = String(num);
-                carry = 0;
-                break;
-            }
-        }
-
-        if (carry === 1) {
-            digits.unshift('1');
-        }
-
-        return digits.join('');
     }
 
     function parseDelimitedLine(line, delimiter) {
@@ -925,7 +813,9 @@ function (file, record, search, format, log) {
     }
 
     function cleanValue(value) {
-        if (value === null || value === undefined) return '';
+        if (value === null || value === undefined) {
+            return '';
+        }
 
         return String(value)
             .replace(/&amp;/g, '&')
@@ -934,7 +824,10 @@ function (file, record, search, format, log) {
     }
 
     function parseSignedAmount(value) {
-        var text = cleanValue(value).replace(/\$/g, '').replace(/,/g, '');
+        var text = cleanValue(value);
+
+        text = text.replace(/\$/g, '');
+        text = text.replace(/,/g, '');
 
         if (text.charAt(0) === '(' && text.charAt(text.length - 1) === ')') {
             text = '-' + text.substring(1, text.length - 1);
@@ -951,33 +844,28 @@ function (file, record, search, format, log) {
 
     function parseDate(value) {
         var text = cleanValue(value);
-
-        if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
-            var isoParts = text.split('-');
-
-            return new Date(
-                parseInt(isoParts[0], 10),
-                parseInt(isoParts[1], 10) - 1,
-                parseInt(isoParts[2], 10)
-            );
-        }
-
         var parts = text.split('/');
 
         if (parts.length !== 3) {
-            throw 'Invalid date format. Expected MM/DD/YYYY or YYYY-MM-DD. Value: ' + value;
+            throw 'Invalid date format. Expected MM/DD/YYYY. Value: ' + value;
         }
 
-        return new Date(
-            parseInt(parts[2], 10),
-            parseInt(parts[0], 10) - 1,
-            parseInt(parts[1], 10)
-        );
+        var month = parseInt(parts[0], 10);
+        var day = parseInt(parts[1], 10);
+        var year = parseInt(parts[2], 10);
+
+        return new Date(year, month - 1, day);
     }
 
     function csvEscape(value) {
-        var text = value === null || value === undefined ? '' : String(value);
-        return '"' + text.replace(/"/g, '""') + '"';
+        if (value === null || value === undefined) {
+            return '""';
+        }
+
+        var text = String(value);
+        text = text.replace(/"/g, '""');
+
+        return '"' + text + '"';
     }
 
     function getDateTimeStamp() {
@@ -996,9 +884,18 @@ function (file, record, search, format, log) {
     }
 
     function getErrorMessage(e) {
-        if (!e) return '';
-        if (typeof e === 'string') return e;
-        if (e.message) return e.message;
+        if (!e) {
+            return '';
+        }
+
+        if (typeof e === 'string') {
+            return e;
+        }
+
+        if (e.message) {
+            return e.message;
+        }
+
         return JSON.stringify(e);
     }
 

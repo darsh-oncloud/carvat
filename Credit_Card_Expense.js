@@ -194,10 +194,10 @@ function (file, record, search, format, log) {
         var searchObj = search.create({
             type: 'customrecord_credit_card_backend_mapping',
             filters: [
-                ['custrecord_card_number', 'anyof', cardNo],
-                'AND',
-                ['custrecord_category', 'anyof', category]
-            ],
+        ["formulatext: {custrecord_card_number}", "is", cardNo],
+        "AND",
+        ["formulatext: {custrecord_category}", "is", category]
+    ],
             columns: [
                 'custrecord_account_number',
                 'custrecord_employee_name'

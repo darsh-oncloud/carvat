@@ -16,7 +16,6 @@ function (file, record, search, format, log) {
     var MAPPING_CATEGORY_FIELD_ID = 'custrecord_category';
     var MAPPING_EXPENSE_ACCOUNT_FIELD_ID = 'custrecord_account_number';
     var MAPPING_EMPLOYEE_NAME_FIELD_ID = 'custrecord_employee_name';
-    var MAPPING_CLASS_FIELD_ID = 'class'; // CHANGE IF NEEDED
 
     var IGNORE_DESCRIPTION_LIST = [
         'ULINE  *SHIP SUPPLIES',
@@ -44,6 +43,10 @@ function (file, record, search, format, log) {
             startingTranId: nextTranId
         });
 
+        if (!pendingFiles || pendingFiles.length === 0) {
+            return [];
+        }
+
         for (var i = 0; i < pendingFiles.length; i++) {
             try {
                 var inputFile = file.load({ id: pendingFiles[i].id });
@@ -53,7 +56,7 @@ function (file, record, search, format, log) {
                     if (isIgnoredDescription(rows[r].Description)) {
                         rows[r].IsSkippedLine = true;
                         rows[r].TranIdNumber = '';
-                        rows[r].InputError = 'Skipped description: ' + rows[r].Description;
+                        rows[r].InputError = 'Skipped description, transaction not created: ' + rows[r].Description;
                     } else {
                         rows[r].TranIdNumber = nextTranId;
                         nextTranId = incrementBigNumberString(nextTranId);
@@ -110,16 +113,6 @@ function (file, record, search, format, log) {
                 throw 'No header account mapping found for card number: ' + cardNo;
             }
 
-            var expenseLine = getExpenseLineFromBackendMapping(cardNo, category);
-
-            if (!expenseLine || !expenseLine.accountId) {
-                throw 'No expense account mapping found. Card: ' + cardNo + ' | Category: ' + category;
-            }
-
-            if (!expenseLine.classId) {
-                throw 'No class found in backend mapping. Card: ' + cardNo + ' | Category: ' + category;
-            }
-
             var rawAmount = parseSignedAmount(rawAmountText);
             var amountPositive = Math.abs(rawAmount);
             var recordType = rawAmount < 0 ? 'creditcardcharge' : 'creditcardrefund';
@@ -128,18 +121,45 @@ function (file, record, search, format, log) {
             var postingPeriodId = getPostingPeriod(postDate);
 
             var entityInfo = getOtherNameEntityInfoFromDescription(description);
-            var finalMemo = buildMainMemo(expenseLine.employeeName, description);
+            var entityId = entityInfo.id;
 
-            log.audit('FINAL VALUES BEFORE CREATE', {
-                tranid: row.TranIdNumber,
+            var expenseLine = getExpenseLineFromBackendMapping(cardNo, category);
+            var historicalLine = getHistoricalExpenseLine(description);
+
+            var employeeName = '';
+
+            if (expenseLine && expenseLine.employeeName) {
+                employeeName = expenseLine.employeeName;
+            }
+
+            if (!expenseLine || !expenseLine.accountId) {
+                expenseLine = historicalLine;
+            }
+
+            if (!expenseLine || !expenseLine.accountId) {
+                throw 'No expense account found from custom mapping or history. Card: ' + cardNo + ' | Category: ' + category + ' | Description: ' + description;
+            }
+
+            if (historicalLine && historicalLine.classId) {
+                expenseLine.classId = historicalLine.classId;
+            }
+
+            if (!expenseLine.classId) {
+                throw 'Class is blank in historical transaction for description: ' + description;
+            }
+
+            var finalMemo = buildMainMemo(employeeName, description);
+
+            log.debug('FINAL VALUES BEFORE CREATE', {
                 cardNo: cardNo,
                 category: category,
-                recordType: recordType,
+                employeeName: employeeName,
+                finalMemo: finalMemo,
                 headerAccount: creditCardAccountId,
                 expenseAccount: expenseLine.accountId,
                 classId: expenseLine.classId,
-                entityId: entityInfo.id,
-                amount: amountPositive
+                amount: amountPositive,
+                recordType: recordType
             });
 
             var ccRec = record.create({
@@ -148,7 +168,7 @@ function (file, record, search, format, log) {
             });
 
             ccRec.setValue({ fieldId: 'tranid', value: String(row.TranIdNumber) });
-            ccRec.setValue({ fieldId: 'entity', value: entityInfo.id });
+            ccRec.setValue({ fieldId: 'entity', value: entityId });
             ccRec.setValue({ fieldId: 'account', value: creditCardAccountId });
             ccRec.setValue({ fieldId: 'usertotal', value: amountPositive });
             ccRec.setValue({ fieldId: 'trandate', value: postDate });
@@ -213,7 +233,7 @@ function (file, record, search, format, log) {
                 line: row.LineNo,
                 tranid: row.TranIdNumber,
                 row: row,
-                error: row.ErrorMessage
+                error: e
             });
 
             context.write({
@@ -280,17 +300,30 @@ function (file, record, search, format, log) {
     }
 
     function getExpenseLineFromBackendMapping(cardNo, category) {
+        var cardInternalId = getCardMappingInternalId(cardNo);
+        var categoryInternalId = getCategoryInternalId(category);
+
+        log.debug('CARD / CATEGORY INTERNAL IDS', {
+            cardNo: cardNo,
+            cardInternalId: cardInternalId,
+            category: category,
+            categoryInternalId: categoryInternalId
+        });
+
+        if (!cardInternalId || !categoryInternalId) {
+            return null;
+        }
+
         var mappingSearch = search.create({
             type: BACKEND_MAPPING_RECORD_TYPE,
             filters: [
-                ['formulatext: {' + MAPPING_CARD_FIELD_ID + '}', 'is', cardNo],
+                [MAPPING_CARD_FIELD_ID, 'anyof', cardInternalId],
                 'AND',
-                ['formulatext: {' + MAPPING_CATEGORY_FIELD_ID + '}', 'is', category]
+                [MAPPING_CATEGORY_FIELD_ID, 'anyof', categoryInternalId]
             ],
             columns: [
                 search.createColumn({ name: MAPPING_EXPENSE_ACCOUNT_FIELD_ID }),
-                search.createColumn({ name: MAPPING_EMPLOYEE_NAME_FIELD_ID }),
-                search.createColumn({ name: MAPPING_CLASS_FIELD_ID })
+                search.createColumn({ name: MAPPING_EMPLOYEE_NAME_FIELD_ID })
             ]
         });
 
@@ -299,7 +332,7 @@ function (file, record, search, format, log) {
             end: 1
         });
 
-        log.debug('BACKEND MAPPING RESULT', {
+        log.debug('BACKEND MAPPING RESULT COUNT', {
             cardNo: cardNo,
             category: category,
             count: results ? results.length : 0
@@ -314,11 +347,169 @@ function (file, record, search, format, log) {
             employeeName: results[0].getText({ name: MAPPING_EMPLOYEE_NAME_FIELD_ID }) ||
                 results[0].getValue({ name: MAPPING_EMPLOYEE_NAME_FIELD_ID }) ||
                 '',
-            classId: results[0].getValue({ name: MAPPING_CLASS_FIELD_ID }) || ''
+            classId: ''
+        };
+    }
+
+    function getCardMappingInternalId(cardNo) {
+        var cardSearch = search.create({
+            type: BACKEND_MAPPING_RECORD_TYPE,
+            filters: [
+                [MAPPING_CARD_FIELD_ID, 'noneof', '@NONE@']
+            ],
+            columns: [
+                search.createColumn({ name: MAPPING_CARD_FIELD_ID })
+            ]
+        });
+
+        var results = cardSearch.run().getRange({
+            start: 0,
+            end: 1000
+        });
+
+        for (var i = 0; results && i < results.length; i++) {
+            var cardText = results[i].getText({ name: MAPPING_CARD_FIELD_ID });
+            var cardValue = results[i].getValue({ name: MAPPING_CARD_FIELD_ID });
+
+            if (
+                cleanValue(cardText) === cleanValue(cardNo) ||
+                cleanValue(cardValue) === cleanValue(cardNo)
+            ) {
+                return cardValue;
+            }
+        }
+
+        return '';
+    }
+
+    function getCategoryInternalId(category) {
+        var categorySearch = search.create({
+            type: BACKEND_MAPPING_RECORD_TYPE,
+            filters: [
+                [MAPPING_CATEGORY_FIELD_ID, 'noneof', '@NONE@']
+            ],
+            columns: [
+                search.createColumn({ name: MAPPING_CATEGORY_FIELD_ID })
+            ]
+        });
+
+        var results = categorySearch.run().getRange({
+            start: 0,
+            end: 1000
+        });
+
+        for (var i = 0; results && i < results.length; i++) {
+            var categoryText = results[i].getText({ name: MAPPING_CATEGORY_FIELD_ID });
+            var categoryValue = results[i].getValue({ name: MAPPING_CATEGORY_FIELD_ID });
+
+            if (
+                normalizeText(categoryText) === normalizeText(category) ||
+                cleanValue(categoryValue) === cleanValue(category)
+            ) {
+                return categoryValue;
+            }
+        }
+
+        return '';
+    }
+
+    function getNextTranIdNumber() {
+        var tranSearch = search.create({
+            type: search.Type.TRANSACTION,
+            filters: [
+                ['type', 'anyof', 'CardChrg', 'CardRfnd'],
+                'AND',
+                ['mainline', 'is', 'T'],
+                'AND',
+                ['tranid', 'isnotempty', '']
+            ],
+            columns: [
+                search.createColumn({ name: 'internalid', sort: search.Sort.DESC }),
+                search.createColumn({ name: 'tranid' })
+            ]
+        });
+
+        var results = tranSearch.run().getRange({
+            start: 0,
+            end: 1
+        });
+
+        if (results && results.length > 0) {
+            var tranIdText = cleanValue(results[0].getValue({ name: 'tranid' }));
+
+            if (isOnlyDigits(tranIdText)) {
+                return incrementBigNumberString(tranIdText);
+            }
+        }
+
+        return String(DEFAULT_TRANID_START_FROM);
+    }
+
+    function getHistoricalExpenseLine(description) {
+        var candidates = getHistoricalSearchCandidates(description);
+
+        for (var i = 0; i < candidates.length; i++) {
+            var candidate = cleanValue(candidates[i]);
+
+            if (!candidate || candidate.length < 3) continue;
+
+            var result = searchHistoricalTransactionLine(candidate);
+
+            if (result && result.accountId) {
+                return result;
+            }
+        }
+
+        return null;
+    }
+
+    function searchHistoricalTransactionLine(searchText) {
+        var headerAccountIds = getHeaderAccountIdList();
+
+        var tranSearch = search.create({
+            type: search.Type.TRANSACTION,
+            filters: [
+                ['mainline', 'is', 'F'],
+                'AND',
+                ['type', 'anyof', 'CardChrg', 'CardRfnd'],
+                'AND',
+                ['account', 'noneof', headerAccountIds],
+                'AND',
+                [
+                    ['memo', 'contains', searchText],
+                    'OR',
+                    ['memomain', 'contains', searchText]
+                ]
+            ],
+            columns: [
+                search.createColumn({ name: 'trandate', sort: search.Sort.DESC }),
+                search.createColumn({ name: 'account' }),
+                search.createColumn({ name: 'class' })
+            ]
+        });
+
+        var results = tranSearch.run().getRange({
+            start: 0,
+            end: 10
+        });
+
+        if (!results || results.length === 0) {
+            return null;
+        }
+
+        return {
+            accountId: results[0].getValue({ name: 'account' }),
+            classId: results[0].getValue({ name: 'class' }) || ''
         };
     }
 
     function getOtherNameEntityInfoFromDescription(description) {
+        var entityInfo = findEntityFromHistory(description);
+
+        if (entityInfo && entityInfo.id) {
+            return entityInfo;
+        }
+
         var cleaned = cleanMerchantName(description);
         var result = findOtherNameByName(cleaned);
 
@@ -326,23 +517,69 @@ function (file, record, search, format, log) {
             return result;
         }
 
-        var words = cleanValue(description).toUpperCase().split(/\s+/);
+        var words = cleanValue(description).toUpperCase().split(/\s+/).map(function (w) {
+            return w.replace(/[^A-Z0-9]/g, '');
+        }).filter(function (w) {
+            return w.length >= 4 && !/^[0-9]+$/.test(w);
+        });
 
         for (var i = 0; i < words.length; i++) {
-            var word = words[i].replace(/[^A-Z0-9]/g, '');
-
-            if (word.length < 4 || /^[0-9]+$/.test(word)) {
-                continue;
-            }
-
-            result = findOtherNameByName(word);
+            result = findOtherNameByName(words[i]);
 
             if (result && result.id) {
                 return result;
             }
         }
 
-        throw 'Other Name not found. Description: ' + description;
+        throw 'Other Name not found. New Other Name will not be created. Description: ' + description;
+    }
+
+    function findEntityFromHistory(description) {
+        var candidates = getHistoricalSearchCandidates(description);
+
+        for (var i = 0; i < candidates.length; i++) {
+            var candidate = cleanValue(candidates[i]);
+
+            if (!candidate || candidate.length < 3) continue;
+
+            var tranSearch = search.create({
+                type: search.Type.TRANSACTION,
+                filters: [
+                    ['type', 'anyof', 'CardChrg', 'CardRfnd'],
+                    'AND',
+                    ['mainline', 'is', 'T'],
+                    'AND',
+                    [
+                        ['memo', 'contains', candidate],
+                        'OR',
+                        ['memomain', 'contains', candidate]
+                    ]
+                ],
+                columns: [
+                    search.createColumn({ name: 'trandate', sort: search.Sort.DESC }),
+                    search.createColumn({ name: 'entity' })
+                ]
+            });
+
+            var results = tranSearch.run().getRange({
+                start: 0,
+                end: 1
+            });
+
+            if (results && results.length > 0) {
+                var entityId = results[0].getValue({ name: 'entity' });
+                var entityName = results[0].getText({ name: 'entity' });
+
+                if (entityId) {
+                    return {
+                        id: entityId,
+                        name: entityName
+                    };
+                }
+            }
+        }
+
+        return null;
     }
 
     function findOtherNameByName(otherNameName) {
@@ -376,6 +613,21 @@ function (file, record, search, format, log) {
             id: results[0].getValue({ name: 'internalid' }),
             name: results[0].getValue({ name: 'entityid' })
         };
+    }
+
+    function buildMainMemo(employeeName, description) {
+        employeeName = cleanValue(employeeName);
+        description = cleanValue(description);
+
+        if (employeeName && description) {
+            return employeeName + ' - ' + description;
+        }
+
+        if (description) {
+            return description;
+        }
+
+        return employeeName || '';
     }
 
     function getPendingFiles() {
@@ -450,6 +702,40 @@ function (file, record, search, format, log) {
         return data;
     }
 
+    function getHistoricalSearchCandidates(description) {
+        var candidates = [];
+        var cleanDescription = cleanValue(description);
+        var merchantName = cleanMerchantName(cleanDescription);
+
+        addCandidate(candidates, merchantName);
+        addCandidate(candidates, cleanDescription);
+
+        if (cleanDescription.indexOf('*') !== -1) {
+            addCandidate(candidates, cleanMerchantName(cleanDescription.substring(0, cleanDescription.indexOf('*'))));
+            addCandidate(candidates, cleanMerchantName(cleanDescription.substring(cleanDescription.indexOf('*') + 1)));
+        }
+
+        return candidates;
+    }
+
+    function getHeaderAccountIdList() {
+        var ids = [];
+        var seen = {};
+
+        for (var card in CARD_ACCOUNT_MAP) {
+            if (CARD_ACCOUNT_MAP.hasOwnProperty(card)) {
+                var id = String(CARD_ACCOUNT_MAP[card]);
+
+                if (!seen[id]) {
+                    seen[id] = true;
+                    ids.push(id);
+                }
+            }
+        }
+
+        return ids;
+    }
+
     function getPostingPeriod(dateObj) {
         var dateText = format.format({
             value: dateObj,
@@ -484,51 +770,8 @@ function (file, record, search, format, log) {
         throw 'Posting period not found for date: ' + dateText;
     }
 
-    function getNextTranIdNumber() {
-        var tranSearch = search.create({
-            type: search.Type.TRANSACTION,
-            filters: [
-                ['type', 'anyof', 'CardChrg', 'CardRfnd'],
-                'AND',
-                ['mainline', 'is', 'T'],
-                'AND',
-                ['tranid', 'isnotempty', '']
-            ],
-            columns: [
-                search.createColumn({ name: 'internalid', sort: search.Sort.DESC }),
-                search.createColumn({ name: 'tranid' })
-            ]
-        });
-
-        var results = tranSearch.run().getRange({
-            start: 0,
-            end: 1
-        });
-
-        if (results && results.length > 0) {
-            var tranIdText = cleanValue(results[0].getValue({ name: 'tranid' }));
-
-            if (/^[0-9]+$/.test(tranIdText)) {
-                return incrementBigNumberString(tranIdText);
-            }
-        }
-
-        return String(DEFAULT_TRANID_START_FROM);
-    }
-
-    function buildMainMemo(employeeName, description) {
-        employeeName = cleanValue(employeeName);
-        description = cleanValue(description);
-
-        if (employeeName && description) {
-            return employeeName + ' - ' + description;
-        }
-
-        return description || employeeName || '';
-    }
-
     function createErrorFile(fileData) {
-        var csv = 'Line No,Tran ID,Card,Transaction Date,Post Date,Description,Category,Amount,Error Message\n';
+        var csv = 'Line No,Tran ID,Card,Transaction Date,Post Date,Description,Amount,Error Message\n';
 
         for (var i = 0; i < fileData.errorRows.length; i++) {
             var row = fileData.errorRows[i];
@@ -539,7 +782,6 @@ function (file, record, search, format, log) {
             csv += csvEscape(row.TransactionDate) + ',';
             csv += csvEscape(row.PostDate) + ',';
             csv += csvEscape(row.Description) + ',';
-            csv += csvEscape(row.Category) + ',';
             csv += csvEscape(row.Amount) + ',';
             csv += csvEscape(row.ErrorMessage) + '\n';
         }
@@ -561,7 +803,7 @@ function (file, record, search, format, log) {
             log.error('FILE MOVE FAILED', {
                 fileId: fileId,
                 folderId: folderId,
-                error: getErrorMessage(e)
+                error: e
             });
         }
     }
@@ -589,6 +831,54 @@ function (file, record, search, format, log) {
             .replace(/\./g, ' ')
             .replace(/\*/g, ' ')
             .replace(/\s+/g, ' ');
+    }
+
+    function addCandidate(candidates, value) {
+        var text = cleanValue(value);
+
+        if (!text) return;
+
+        for (var i = 0; i < candidates.length; i++) {
+            if (normalizeText(candidates[i]) === normalizeText(text)) {
+                return;
+            }
+        }
+
+        candidates.push(text);
+    }
+
+    function normalizeText(value) {
+        return cleanValue(value)
+            .toLowerCase()
+            .replace(/&/g, 'and')
+            .replace(/[^a-z0-9]/g, '');
+    }
+
+    function isOnlyDigits(value) {
+        return /^[0-9]+$/.test(cleanValue(value));
+    }
+
+    function incrementBigNumberString(value) {
+        var digits = cleanValue(value).split('');
+        var carry = 1;
+
+        for (var i = digits.length - 1; i >= 0; i--) {
+            var num = parseInt(digits[i], 10) + carry;
+
+            if (num === 10) {
+                digits[i] = '0';
+            } else {
+                digits[i] = String(num);
+                carry = 0;
+                break;
+            }
+        }
+
+        if (carry === 1) {
+            digits.unshift('1');
+        }
+
+        return digits.join('');
     }
 
     function parseDelimitedLine(line, delimiter) {
@@ -683,29 +973,6 @@ function (file, record, search, format, log) {
             parseInt(parts[0], 10) - 1,
             parseInt(parts[1], 10)
         );
-    }
-
-    function incrementBigNumberString(value) {
-        var digits = cleanValue(value).split('');
-        var carry = 1;
-
-        for (var i = digits.length - 1; i >= 0; i--) {
-            var num = parseInt(digits[i], 10) + carry;
-
-            if (num === 10) {
-                digits[i] = '0';
-            } else {
-                digits[i] = String(num);
-                carry = 0;
-                break;
-            }
-        }
-
-        if (carry === 1) {
-            digits.unshift('1');
-        }
-
-        return digits.join('');
     }
 
     function csvEscape(value) {
